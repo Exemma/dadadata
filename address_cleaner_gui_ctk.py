@@ -17,14 +17,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import customtkinter as ctk
 import httpx
-from dadata import Dadata
 
 from address_cleaner_core import (
-    REQUEST_TIMEOUT,
     YANDEX_EXCEL_HEADERS,
     apply_proxy_from_value,
     clear_proxy_env,
+    connection_log_clear,
+    connection_log_text,
     dadata_excel_headers,
+    dadata_get_balance,
+    dadata_get_daily_stats,
     fetch_yandex_developer_limits_report,
     format_daily_stats_human,
     process_addresses,
@@ -61,6 +63,9 @@ class AddressCleanerApp:
         self.root.minsize(560, 420)
 
         self._worker: Optional[threading.Thread] = None
+        self._connection_log_win: Optional[ctk.CTkToplevel] = None
+        self._connection_log_tb: Optional[ctk.CTkTextbox] = None
+        self._connection_log_poll_id: Optional[Any] = None
         self._full_expanded = False
         self._last_dadata_excel_rows: Optional[List[List[str]]] = None
         self._last_yandex_excel_rows: Optional[List[List[str]]] = None
@@ -185,6 +190,14 @@ class AddressCleanerApp:
             font=font_std,
         )
         self._proxy_chk.pack(side="left")
+        self.connection_log_btn = ctk.CTkButton(
+            cred_row_proxy,
+            text="Журнал соединений",
+            command=self._on_connection_log,
+            width=168,
+            **self._sec_btn,
+        )
+        self.connection_log_btn.pack(side="left", padx=(16, 0))
 
         main = ctk.CTkFrame(outer, fg_color="transparent")
         main.grid(row=grid_row, column=0, sticky="nsew", pady=(0, 4))
@@ -432,6 +445,7 @@ class AddressCleanerApp:
         self.stats_btn.configure(state=st)
         self.yandex_dev_btn.configure(state=st)
         self._proxy_settings_btn.configure(state=st)
+        self.connection_log_btn.configure(state="normal")
         self.export_dadata_btn.configure(
             state="disabled"
             if loading
@@ -472,6 +486,90 @@ class AddressCleanerApp:
         ctk.CTkButton(btn_row, text="Копировать JSON", command=copy_json, **self._sec_btn).pack(side="left")
         ctk.CTkButton(btn_row, text="Закрыть", command=win.destroy, **self._sec_btn).pack(side="right")
 
+    def _refresh_connection_log_view(self) -> None:
+        tb = self._connection_log_tb
+        if tb is not None and tb.winfo_exists():
+            _tb_set(tb, connection_log_text(), readonly=True)
+
+    def _cancel_connection_log_poll(self) -> None:
+        if self._connection_log_poll_id is not None:
+            try:
+                self.root.after_cancel(self._connection_log_poll_id)
+            except (tk.TclError, ValueError):
+                pass
+            self._connection_log_poll_id = None
+
+    def _schedule_connection_log_poll(self) -> None:
+        win = self._connection_log_win
+        if win is None or not win.winfo_exists():
+            self._cancel_connection_log_poll()
+            return
+        self._cancel_connection_log_poll()
+        self._refresh_connection_log_view()
+        if self._worker is not None and self._worker.is_alive():
+            self._connection_log_poll_id = self.root.after(450, self._schedule_connection_log_poll)
+
+    def _on_connection_log(self) -> None:
+        if self._connection_log_win is not None:
+            try:
+                if self._connection_log_win.winfo_exists():
+                    self._connection_log_win.lift()
+                    self._schedule_connection_log_poll()
+                    return
+            except tk.TclError:
+                pass
+            self._connection_log_win = None
+            self._connection_log_tb = None
+
+        win = ctk.CTkToplevel(self.root)
+        self._connection_log_win = win
+        win.title("Журнал соединений — DaData / Яндекс")
+        win.geometry("720x440")
+        win.minsize(480, 280)
+
+        outer = ctk.CTkFrame(win, fg_color="transparent")
+        outer.pack(fill="both", expand=True, padx=12, pady=12)
+
+        ctk.CTkLabel(
+            outer,
+            text="Запросы к API: время, сервис, этап и результат (ключи в лог не пишутся).",
+            text_color="gray65",
+            font=ctk.CTkFont(size=13),
+        ).pack(anchor="w", pady=(0, 8))
+
+        tb = ctk.CTkTextbox(outer, font=ctk.CTkFont(family="Consolas", size=12), wrap="word")
+        tb.pack(fill="both", expand=True)
+        self._connection_log_tb = tb
+        _tb_set(tb, connection_log_text(), readonly=True)
+
+        btn_row = ctk.CTkFrame(outer, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(12, 0))
+
+        def on_clear() -> None:
+            connection_log_clear()
+            self._refresh_connection_log_view()
+
+        def on_copy() -> None:
+            win.clipboard_clear()
+            win.clipboard_append(connection_log_text())
+            win.update()
+
+        def on_close() -> None:
+            self._cancel_connection_log_poll()
+            self._connection_log_win = None
+            self._connection_log_tb = None
+            win.destroy()
+
+        ctk.CTkButton(btn_row, text="Обновить", command=self._refresh_connection_log_view, **self._sec_btn).pack(
+            side="left"
+        )
+        ctk.CTkButton(btn_row, text="Очистить", command=on_clear, **self._sec_btn).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(btn_row, text="Копировать", command=on_copy, **self._sec_btn).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(btn_row, text="Закрыть", command=on_close, **self._sec_btn).pack(side="right")
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        self._schedule_connection_log_poll()
+
     def _on_balance(self) -> None:
         if self._worker is not None and self._worker.is_alive():
             return
@@ -487,8 +585,7 @@ class AddressCleanerApp:
             err: Optional[BaseException] = None
             bal: Optional[float] = None
             try:
-                with Dadata(token, secret, timeout=REQUEST_TIMEOUT) as dadata:
-                    bal = dadata.get_balance()
+                bal = dadata_get_balance(token, secret)
             except BaseException as e:
                 err = e
 
@@ -521,8 +618,7 @@ class AddressCleanerApp:
             err: Optional[BaseException] = None
             stats: Optional[Dict[str, Any]] = None
             try:
-                with Dadata(token, secret, timeout=REQUEST_TIMEOUT) as dadata:
-                    stats = dadata.get_daily_stats()
+                stats = dadata_get_daily_stats(token, secret)
             except BaseException as e:
                 err = e
 

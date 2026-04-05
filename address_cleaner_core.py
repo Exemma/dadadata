@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,6 +26,67 @@ from dadata import Dadata  # noqa: E402
 from openpyxl import Workbook
 
 REQUEST_TIMEOUT = 30
+
+_CONNECTION_LOG_MAX = 800
+_connection_log_deque: deque[str] = deque(maxlen=_CONNECTION_LOG_MAX)
+_connection_log_lock = threading.Lock()
+
+
+def connection_log_clear() -> None:
+    with _connection_log_lock:
+        _connection_log_deque.clear()
+
+
+def connection_log_text() -> str:
+    with _connection_log_lock:
+        return "\n".join(_connection_log_deque)
+
+
+def _connection_log(service: str, message: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] [{service}] {message}"
+    with _connection_log_lock:
+        _connection_log_deque.append(line)
+
+
+def _connection_log_proxy_hint() -> None:
+    p = (os.environ.get("HTTPS_PROXY") or os.environ.get("ALL_PROXY") or "").strip()
+    if p:
+        _connection_log("Сеть", "Используется прокси (HTTPS_PROXY/ALL_PROXY)")
+    else:
+        _connection_log("Сеть", "Прямое соединение (прокси не задан)")
+
+
+def dadata_get_balance(token: str, secret: Optional[str]) -> Any:
+    _connection_log_proxy_hint()
+    _connection_log("DaData", "Запрос баланса (get_balance)…")
+    t0 = time.perf_counter()
+    try:
+        with Dadata(token, secret, timeout=REQUEST_TIMEOUT) as dadata:
+            bal = dadata.get_balance()
+        ms = (time.perf_counter() - t0) * 1000
+        _connection_log("DaData", f"Баланс: {bal} ({ms:.0f} мс)")
+        return bal
+    except BaseException as e:
+        ms = (time.perf_counter() - t0) * 1000
+        _connection_log("DaData", f"Ошибка баланса ({ms:.0f} мс): {e!s}")
+        raise
+
+
+def dadata_get_daily_stats(token: str, secret: Optional[str]) -> Dict[str, Any]:
+    _connection_log_proxy_hint()
+    _connection_log("DaData", "Запрос суточной статистики (get_daily_stats)…")
+    t0 = time.perf_counter()
+    try:
+        with Dadata(token, secret, timeout=REQUEST_TIMEOUT) as dadata:
+            stats = dadata.get_daily_stats()
+        ms = (time.perf_counter() - t0) * 1000
+        _connection_log("DaData", f"Статистика получена ({ms:.0f} мс)")
+        return stats
+    except BaseException as e:
+        ms = (time.perf_counter() - t0) * 1000
+        _connection_log("DaData", f"Ошибка статистики ({ms:.0f} мс): {e!s}")
+        raise
 
 
 def _local_credentials_file() -> Path:
@@ -562,9 +625,23 @@ def _yandex_dev_render_limits(lim_raw: Any, base_indent: str = "    ", depth: in
 def _yandex_dev_get_json(client: httpx.Client, path: str) -> Any:
     """GET path относительно API кабинета; при 404 дублирует запрос с префиксом /v1."""
     url = f"{YANDEX_DEVELOPER_API_BASE}{path}"
-    r = client.get(url)
+    _connection_log("Яндекс кабинет", f"GET {path}")
+    t0 = time.perf_counter()
+    try:
+        r = client.get(url)
+    except BaseException as e:
+        _connection_log("Яндекс кабинет", f"Сбой соединения GET {path}: {e!s}")
+        raise
     if r.status_code == 404 and not path.startswith("/v1"):
-        r = client.get(f"{YANDEX_DEVELOPER_API_BASE}/v1{path}")
+        alt = f"/v1{path}"
+        _connection_log("Яндекс кабинет", f"HTTP 404 → повтор {alt}")
+        try:
+            r = client.get(f"{YANDEX_DEVELOPER_API_BASE}{alt}")
+        except BaseException as e:
+            _connection_log("Яндекс кабинет", f"Сбой соединения GET {alt}: {e!s}")
+            raise
+    ms = (time.perf_counter() - t0) * 1000
+    _connection_log("Яндекс кабинет", f"HTTP {r.status_code}, {ms:.0f} мс")
     r.raise_for_status()
     return r.json()
 
@@ -612,6 +689,8 @@ def fetch_yandex_developer_limits_report(auth_key: str) -> str:
     Сводка лимитов через API кабинета разработчика (заголовок X-Auth-Key).
     См. документацию сервиса «API кабинета» в developer.tech.yandex.ru.
     """
+    _connection_log_proxy_hint()
+    _connection_log("Яндекс кабинет", "Формирование отчёта лимитов (несколько запросов к API)…")
     headers = {"X-Auth-Key": auth_key.strip()}
     lines: List[str] = []
     lines.append("Лимиты API кабинета Яндекса")
@@ -737,17 +816,21 @@ def process_yandex_geocode(lines: List[str], api_key: str) -> Tuple[str, str, st
 
     Возвращает (координаты построчно, адреса построчно, полный вывод, строки для Excel).
     """
+    _connection_log_proxy_hint()
+    sources = [raw.strip() for raw in lines if raw.strip()]
+    total = len(sources)
+    _connection_log("Яндекс геокодер", f"Старт: {total} запрос(ов) к geocode-maps.yandex.ru")
     coord_parts: List[str] = []
     addr_parts: List[str] = []
     full_parts: List[str] = []
     excel_rows: List[List[str]] = []
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-        for idx, raw in enumerate(lines):
-            source = raw.strip()
-            if not source:
-                continue
+        for idx, source in enumerate(sources):
             if idx > 0:
                 time.sleep(YANDEX_GEOCODE_PAUSE_SEC)
+            preview = source if len(source) <= 72 else source[:69] + "…"
+            _connection_log("Яндекс геокодер", f"GET {idx + 1}/{total}: «{preview}»")
+            t0 = time.perf_counter()
             try:
                 r = client.get(
                     YANDEX_GEOCODE_URL,
@@ -759,6 +842,8 @@ def process_yandex_geocode(lines: List[str], api_key: str) -> Tuple[str, str, st
                         "results": 1,
                     },
                 )
+                ms = (time.perf_counter() - t0) * 1000
+                _connection_log("Яндекс геокодер", f"Ответ HTTP {r.status_code}, {ms:.0f} мс")
                 r.raise_for_status()
                 data = r.json()
                 if not isinstance(data, dict):
@@ -785,6 +870,8 @@ def process_yandex_geocode(lines: List[str], api_key: str) -> Tuple[str, str, st
                         f"Адрес (Яндекс): {addr_block}\n"
                     )
             except Exception as e:
+                ms = (time.perf_counter() - t0) * 1000
+                _connection_log("Яндекс геокодер", f"Ошибка ({ms:.0f} мс): {e!s}")
                 msg = _format_yandex_request_error(e)
                 err_line = f"Ошибка: {msg.splitlines()[0]}"
                 coord_parts.append(err_line)
@@ -801,20 +888,31 @@ def process_yandex_geocode(lines: List[str], api_key: str) -> Tuple[str, str, st
 
 
 def process_addresses(lines: List[str], token: str, secret: Optional[str]) -> Tuple[str, str, List[List[str]]]:
+    _connection_log_proxy_hint()
+    pending = sum(1 for raw in lines if raw.strip())
+    _connection_log("DaData", f"Старт clean/address: {pending} адрес(ов)")
     short_parts: List[str] = []
     full_parts: List[str] = []
     excel_rows: List[List[str]] = []
+    n = 0
     with Dadata(token, secret, timeout=REQUEST_TIMEOUT) as dadata:
         for raw in lines:
             source = raw.strip()
             if not source:
                 continue
+            n += 1
+            _connection_log("DaData", f"clean address {n}/{pending}…")
+            t0 = time.perf_counter()
             try:
                 data = dadata.clean(name="address", source=source)
+                ms = (time.perf_counter() - t0) * 1000
+                _connection_log("DaData", f"OK {n}/{pending} ({ms:.0f} мс)")
                 short_parts.append(format_short_line(data))
                 full_parts.append(format_clean_block(source, data))
                 excel_rows.append(_dadata_excel_row(source, data, None))
             except Exception as e:
+                ms = (time.perf_counter() - t0) * 1000
+                _connection_log("DaData", f"Ошибка {n}/{pending} ({ms:.0f} мс): {e!s}")
                 short_parts.append(f"Ошибка: {e!s}")
                 full_parts.append(format_error_block(source, e))
                 excel_rows.append(_dadata_excel_row(source, None, e))
