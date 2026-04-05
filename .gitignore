@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Локальный Excel с макросами (не в репозитории)
+ГеокодерGeoYandexGoogle, v.4.2.xlsm
