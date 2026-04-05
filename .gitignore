@@ -5,3 +5,6 @@ __pycache__/
 
 # Локальный Excel с макросами (не в репозитории)
 ГеокодерGeoYandexGoogle, v.4.2.xlsm
+
+# Локальные демо сравнения Tkinter / CustomTkinter (не часть релиза)
+demo_gui_*.py
